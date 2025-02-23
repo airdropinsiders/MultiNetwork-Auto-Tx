@@ -3,89 +3,225 @@ const fs = require("fs");
 const readline = require("readline");
 const axios = require("axios");
 
-const networks = {
-  somnia: {
-    name: "Somnia Testnet",
-    chainId: 50312,
-    rpc: "https://dream-rpc.somnia.network",
-    symbol: "STT",
-    explorer: "https://somnia-testnet.socialscan.io",
-  },
-  nexus: {
-    name: "Nexus Network",
-    chainId: 392,
-    rpc: "https://rpc.nexus.xyz/http",
-    symbol: "NEX",
-    explorer: "https://explorer.nexus.xyz",
-  },
-};
-
+// Constants
+const CLAIMS_FILE = "claims.json";
 const WALLET_FILE = "wallets.txt";
 const FAUCET_API = "https://testnet.somnia.network/api/faucet";
+const COOLDOWN_HOURS = 24;
+const MAX_CLAIMS_PER_DAY = 10;
 
+// Network configurations
+const networks = {
+    somnia: {
+        name: "Somnia Testnet",
+        chainId: 50312,
+        rpc: "https://dream-rpc.somnia.network",
+        symbol: "STT",
+        explorer: "https://somnia-testnet.socialscan.io",
+    },
+    nexus: {
+        name: "Nexus Network",
+        chainId: 392,
+        rpc: "https://rpc.nexus.xyz/http",
+        symbol: "NEX",
+        explorer: "https://explorer.nexus.xyz",
+    },
+};
+
+// Setup readline interface
 const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
+    input: process.stdin,
+    output: process.stdout,
 });
 
-const askQuestion = (query) =>
-  new Promise((resolve) => rl.question(query, resolve));
+const askQuestion = (query) => new Promise((resolve) => rl.question(query, resolve));
 
-async function handleSingleFaucetClaim() {
-  try {
-    const address = await askQuestion("Enter your wallet address: ");
-
-    if (!ethers.isAddress(address)) {
-      console.error("Invalid Ethereum address!");
-      return;
-    }
-
-    console.log("\nAttempting to claim faucet...");
-    let attempts = 0;
-    const maxAttempts = 3;
-
-    while (attempts < maxAttempts) {
-      const result = await claimFaucet(address);
-
-      if (result.success) {
-        console.log(`Claim successful! TX Hash: ${result.hash}`);
-        console.log(
-          `Amount: ${ethers.formatEther(result.amount)} ${
-            networks.somnia.symbol
-          }`
-        );
-        return;
-      } else if (result.error.includes("429")) {
-        attempts++;
-        if (attempts < maxAttempts) {
-          const waitTime = 60; // 1 minute
-          console.log(
-            `Rate limit reached. Waiting ${waitTime} seconds before retry... (Attempt ${attempts}/${maxAttempts})`
-          );
-          await new Promise((resolve) => setTimeout(resolve, waitTime * 1000));
-        } else {
-          console.log(
-            "Maximum retry attempts reached. Please try again later."
-          );
+// Claim history management
+function loadClaimHistory() {
+    try {
+        if (fs.existsSync(CLAIMS_FILE)) {
+            return JSON.parse(fs.readFileSync(CLAIMS_FILE, "utf8"));
         }
-      } else {
-        console.log(`Claim failed: ${result.error}`);
-        return;
-      }
+        return {
+            claims: {},
+            dailyCount: 0,
+            lastReset: Date.now()
+        };
+    } catch (error) {
+        console.error("Error loading claim history:", error.message);
+        return { claims: {}, dailyCount: 0, lastReset: Date.now() };
     }
-  } catch (error) {
-    console.error("Error:", error.message);
-  }
 }
 
+function saveClaimHistory(claimData) {
+    try {
+        fs.writeFileSync(CLAIMS_FILE, JSON.stringify(claimData, null, 2));
+    } catch (error) {
+        console.error("Error saving claim history:", error.message);
+    }
+}
+
+function canClaim(address) {
+    const claimData = loadClaimHistory();
+    const now = Date.now();
+
+    // Reset daily counter if 24 hours passed
+    if ((now - claimData.lastReset) >= (COOLDOWN_HOURS * 60 * 60 * 1000)) {
+        claimData.dailyCount = 0;
+        claimData.lastReset = now;
+        saveClaimHistory(claimData);
+    }
+
+    // Check daily limit
+    if (claimData.dailyCount >= MAX_CLAIMS_PER_DAY) {
+        const nextReset = new Date(claimData.lastReset + (COOLDOWN_HOURS * 60 * 60 * 1000));
+        return {
+            canClaim: false,
+            error: `Daily limit reached (${MAX_CLAIMS_PER_DAY} claims). Reset at ${nextReset.toLocaleString()}`
+        };
+    }
+
+    // Check individual address cooldown
+    const lastClaim = claimData.claims[address];
+    if (lastClaim) {
+        const hoursSinceLastClaim = (now - lastClaim) / (1000 * 60 * 60);
+        if (hoursSinceLastClaim < COOLDOWN_HOURS) {
+            const hoursRemaining = Math.ceil(COOLDOWN_HOURS - hoursSinceLastClaim);
+            return {
+                canClaim: false,
+                error: `This address must wait ${hoursRemaining} hours before claiming again.`
+            };
+        }
+    }
+
+    return { canClaim: true };
+}
+
+// Core functions
+async function claimFaucet(address) {
+    try {
+        const claimCheck = canClaim(address);
+        if (!claimCheck.canClaim) {
+            return {
+                success: false,
+                error: claimCheck.error
+            };
+        }
+
+        await randomDelay(5, 10);
+
+        const response = await axios.post(
+            FAUCET_API,
+            { address },
+            {
+                headers: {
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                },
+            }
+        );
+
+        if (response.data.success) {
+            const claimData = loadClaimHistory();
+            claimData.claims[address] = Date.now();
+            claimData.dailyCount++;
+            saveClaimHistory(claimData);
+
+            return {
+                success: true,
+                hash: response.data.data.hash,
+                amount: response.data.data.amount,
+                remainingClaims: MAX_CLAIMS_PER_DAY - claimData.dailyCount
+            };
+        }
+        return { success: false, error: "Faucet claim failed" };
+    } catch (error) {
+        if (error.response && error.response.status === 429) {
+            return {
+                success: false,
+                error: "Maximum 10 claims per IP in 24 hours reached."
+            };
+        }
+        return { success: false, error: error.message };
+    }
+}
+
+async function handleSingleFaucetClaim() {
+    try {
+        const address = await askQuestion("Enter your wallet address: ");
+
+        if (!ethers.isAddress(address)) {
+            console.error("Invalid Ethereum address!");
+            return;
+        }
+
+        console.log("\nAttempting to claim faucet...");
+        const result = await claimFaucet(address);
+
+        if (result.success) {
+            console.log(`Claim successful! TX Hash: ${result.hash}`);
+            console.log(
+                `Amount: ${ethers.formatEther(result.amount)} ${networks.somnia.symbol}`
+            );
+            console.log(`Remaining claims today: ${result.remainingClaims}`);
+        } else {
+            console.log(`Claim failed: ${result.error}`);
+        }
+    } catch (error) {
+        console.error("Error:", error.message);
+    }
+}
+
+async function checkClaimStatus() {
+    try {
+        const claimData = loadClaimHistory();
+        const now = Date.now();
+        
+        console.log("\n=== Faucet Claim Status ===");
+        console.log(`Daily Claims Used: ${claimData.dailyCount}/${MAX_CLAIMS_PER_DAY}`);
+        
+        if (claimData.dailyCount >= MAX_CLAIMS_PER_DAY) {
+            const nextReset = new Date(claimData.lastReset + (COOLDOWN_HOURS * 60 * 60 * 1000));
+            console.log(`Next Reset: ${nextReset.toLocaleString()}`);
+        } else {
+            console.log(`Remaining Claims Today: ${MAX_CLAIMS_PER_DAY - claimData.dailyCount}`);
+        }
+
+        const address = await askQuestion("\nEnter wallet address to check specific status: ");
+
+        if (!ethers.isAddress(address)) {
+            console.error("Invalid Ethereum address!");
+            return;
+        }
+
+        const claimCheck = canClaim(address);
+        if (claimCheck.canClaim) {
+            console.log("\nThis address is eligible to claim!");
+        } else {
+            console.log(`\n${claimCheck.error}`);
+        }
+    } catch (error) {
+        console.error("Error:", error.message);
+    }
+}
+
+// Utility functions
 function randomDelay(min, max) {
-  const delay = (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
-  return new Promise((resolve) => setTimeout(resolve, delay));
+    const delay = (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
+    return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function generateNewWallet() {
+    const wallet = ethers.Wallet.createRandom();
+    return {
+        address: wallet.address,
+        privateKey: wallet.privateKey,
+    };
 }
 
 function saveWalletToFile(address, privateKey) {
-  const walletData = `${address}:${privateKey}\n`;
-  fs.appendFileSync(WALLET_FILE, walletData);
+    const walletData = `${address}:${privateKey}\n`;
+    fs.appendFileSync(WALLET_FILE, walletData);
 }
 
 function generateNewWallet() {
@@ -128,7 +264,7 @@ async function claimFaucet(address) {
       return {
         success: false,
         error:
-          "Rate limit reached. Please wait 15-30 minutes before trying again.",
+          "Rate limit reached. Please wait 24 hours before trying again.",
       };
     }
     return { success: false, error: error.message };
@@ -257,9 +393,10 @@ async function showMenu() {
     console.log("2. Generate Wallets & Claim Faucet (Somnia)");
     console.log("3. Transfer STT Tokens (Somnia)");
     console.log("4. Transfer NEX Tokens (Nexus)");
-    console.log("5. Exit");
+    console.log("5. Check Faucet Claim Status");
+    console.log("6. Exit");
 
-    const choice = await askQuestion("\nSelect menu (1-5): ");
+    const choice = await askQuestion("\nSelect menu (1-6): ");
 
     switch (choice) {
       case "1":
@@ -275,6 +412,9 @@ async function showMenu() {
         await handleTokenTransfers("nexus");
         break;
       case "5":
+        await checkClaimStatus();
+        break;
+      case "6":
         console.log("Thank you for using this bot!");
         rl.close();
         process.exit(0);
