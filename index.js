@@ -144,6 +144,8 @@ async function selectWallet(network) {
 
 function randomDelay(min, max) {
     const delay = (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
+    console.log(`Waiting ${delay/1000} seconds before next transaction...`);
+
     return new Promise(resolve => setTimeout(resolve, delay));
 }
 
@@ -270,8 +272,7 @@ async function handleTokenTransfers(network) {
             await transaction.wait();
             
             if (i < numberOfTx - 1) {
-                const delay = await randomDelay(parseInt(minDelay), parseInt(maxDelay));
-                console.log(`Waiting ${delay/1000} seconds before next transaction...`);
+                await randomDelay(parseInt(minDelay), parseInt(maxDelay));
             }
         }
 
